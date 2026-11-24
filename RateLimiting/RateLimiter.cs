@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
 using Microsoft.Extensions.Options;
 
 namespace ChaosProxy.RateLimiting;
@@ -17,14 +18,14 @@ public class RateLimiter
         }
     }
 
-    private readonly ConcurrentDictionary<string, BucketEntry> _buckets = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<IPAddress, BucketEntry> _buckets = new();
     private readonly RateLimiterOptions _options;
     private readonly Timer _cleanupTimer;
 
     public RateLimiter(IOptions<RateLimiterOptions> options)
     {
         _options=options.Value;
-        //run idle bucket cleanup every  mins
+        //run idle bucket cleanup every 2 mins
         _cleanupTimer = new Timer(
             CleanupIdleBuckets,
             null,
@@ -32,16 +33,19 @@ public class RateLimiter
             TimeSpan.FromMinutes(2));
     }
 
-    public RateLimitDecision ShouldAllowRequest(string clientKey)
+    public RateLimitDecision ShouldAllowRequest(IPAddress clientIp)
     {
         var entry = _buckets.GetOrAdd(
-            clientKey,
+            clientIp,
             static (_, opts) => new BucketEntry(opts.Capacity, opts.TokensPerSecond),
             _options
         );
         Volatile.Write(ref entry.LastSeenTicks, Stopwatch.GetTimestamp());
         return entry.Bucket.TryConsume();
     }
+
+    public RateLimitDecision ShouldAllowRequest(string clientKey)
+        => ShouldAllowRequest(IPAddress.TryParse(clientKey, out var ip) ? ip : IPAddress.None);
 
     private void CleanupIdleBuckets(object? state)
     {

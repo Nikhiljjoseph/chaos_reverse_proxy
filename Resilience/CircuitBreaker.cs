@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Options;
+using ChaosProxy.Forwarding;
 
 namespace ChaosProxy.Resilience;
 
@@ -21,57 +22,70 @@ public class CircuitBreaker
 
     public CircuitState CurrentState => (CircuitState)Volatile.Read(ref _state);
 
-    public async Task ExecuteAsync(HttpContext context, Func<Task> forwardAction)
+    public Task ExecuteAsync(HttpContext context, HttpForwarder forwarder)
     {
         if (!_options.Enabled)
         {
-            await forwardAction();
-            return;
+            return forwarder.ForwardAsync(context);
         }
+
         CheckCooldownExpiry();
-        var _state = CurrentState;
+        var state = CurrentState;
 
-        //open state - fail immediately
-        if(_state == CircuitState.Open)
+        if (state == CircuitState.Open)
         {
-            await FastFailAsync(context);
-            return;
+            return FastFailAsync(context);
         }
 
-        //half open state - permit only one request
-        if(_state == CircuitState.HalfOpen)
+        if (state == CircuitState.HalfOpen)
         {
-            if(Interlocked.CompareExchange(ref _halfOpenProbeInProgress, 1, 0) != 0)
+            if (Interlocked.CompareExchange(ref _halfOpenProbeInProgress, 1, 0) != 0)
             {
-                //if there is another request already, fail this one
-                await FastFailAsync(context);
-                return;
+                return FastFailAsync(context);
             }
-            try
-            {
-                await ExecuteAndRecordAsync(context, forwardAction, isProbe: true);
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _halfOpenProbeInProgress, 0);
-            }
-            return;
+            return ExecuteProbeForwardAsync(context, forwarder);
         }
 
-        //closed state - normal flow
-        await ExecuteAndRecordAsync(context, forwardAction, isProbe: false);
+        return ExecuteAndRecordForwardAsync(context, forwarder, isProbe: false);
     }
 
-    public async Task ExecuteAndRecordAsync(HttpContext context, Func<Task> forwardAction, bool isProbe)
+    private async Task ExecuteProbeForwardAsync(HttpContext context, HttpForwarder forwarder)
     {
-        bool isFault = false;
         try
         {
-            await forwardAction();
-            if(context.Response.StatusCode>=500)
+            await ExecuteAndRecordForwardAsync(context, forwarder, isProbe: true);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _halfOpenProbeInProgress, 0);
+        }
+    }
+
+    private async Task ExecuteAndRecordForwardAsync(HttpContext context, HttpForwarder forwarder, bool isProbe)
+    {
+        bool isFault = false;
+        bool clientAborted = false;
+        try
+        {
+            await forwarder.ForwardAsync(context);
+            if (context.Response.StatusCode >= 500)
                 isFault = true;
         }
-        catch(Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+        {
+            isFault = true;
+            _logger.LogWarning("CircuitBreaker: Upstream request timed out.");
+            if (!context.Response.HasStarted)
+            {
+                context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            clientAborted = true;
+            throw;
+        }
+        catch (Exception ex)
         {
             isFault = true;
             _logger.LogError(ex, "CircuitBreaker: Upstream call failed with unhandled exception.");
@@ -79,19 +93,17 @@ public class CircuitBreaker
         }
         finally
         {
-            if (isFault)
+            if (!clientAborted)
             {
-                OnFailure(isProbe);
-            }
-            else
-            {
-                OnSuccess(isProbe);
+                if (isFault) OnFailure(isProbe);
+                else OnSuccess(isProbe);
             }
         }
     }
+
     private void OnSuccess(bool isProbe)
     {
-        if(isProbe || CurrentState == CircuitState.HalfOpen)
+        if (isProbe || CurrentState == CircuitState.HalfOpen)
         {
             _logger.LogInformation("CircuitBreaker: Probe succeeded. Transitioning from Half-Open to CLOSED.");
             TransitionTo(CircuitState.Closed);
@@ -125,10 +137,10 @@ public class CircuitBreaker
 
     private void CheckCooldownExpiry()
     {
-        if(CurrentState == CircuitState.Open)
+        if (CurrentState == CircuitState.Open)
         {
             long expiry = Volatile.Read(ref _cooldownExpiryTimestamp);
-            if(Stopwatch.GetTimestamp() >= expiry)
+            if (Stopwatch.GetTimestamp() >= expiry)
             {
                 if (Interlocked.CompareExchange(ref _state, (int)CircuitState.HalfOpen, (int)CircuitState.Open) == (int)CircuitState.Open)
                 {

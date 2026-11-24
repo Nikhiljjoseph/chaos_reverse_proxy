@@ -1,18 +1,9 @@
-using System.Net;
 using ChaosProxy.Forwarding;
 using ChaosProxy.Chaos;
 using ChaosProxy.Resilience;
 using ChaosProxy.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddHttpClient<HttpForwarder>()
-.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
-{
-    UseProxy = false,
-    AllowAutoRedirect = false,
-    AutomaticDecompression = DecompressionMethods.None,
-});
 
 builder.Services.Configure<ForwarderOptions>(
     builder.Configuration.GetSection(ForwarderOptions.SectionName)
@@ -27,18 +18,37 @@ builder.Services.Configure<RateLimiterOptions>(
     builder.Configuration.GetSection(RateLimiterOptions.SectionName)
 );
 
+builder.Services.AddSingleton<HttpForwarder>();
 builder.Services.AddSingleton<ChaosEngine>();
 builder.Services.AddSingleton<CircuitBreaker>();
 builder.Services.AddSingleton<RateLimiter>();
 
 var app = builder.Build();
 
+var forwarder = app.Services.GetRequiredService<HttpForwarder>();
+var chaosEngine = app.Services.GetRequiredService<ChaosEngine>();
+var circuitBreaker = app.Services.GetRequiredService<CircuitBreaker>();
+
 app.UseMiddleware<RateLimiterMiddleware>();
 
-app.MapFallback(async (HttpContext context, HttpForwarder forwarder, ChaosEngine chaosEngine, CircuitBreaker circuitBreaker) =>
+app.Run(context =>
 {
-    if(await chaosEngine.TryApplyChaosAsync(context)) return;
-    await circuitBreaker.ExecuteAsync(context, async() => await forwarder.ForwardAsync(context));
+    if (chaosEngine.IsEnabled)
+    {
+        return HandleWithChaosAsync(context, forwarder, chaosEngine, circuitBreaker);
+    }
+
+    return circuitBreaker.ExecuteAsync(context, forwarder);
 });
 
 app.Run();
+
+static async Task HandleWithChaosAsync(
+    HttpContext context,
+    HttpForwarder forwarder,
+    ChaosEngine chaosEngine,
+    CircuitBreaker circuitBreaker)
+{
+    if (await chaosEngine.TryApplyChaosAsync(context)) return;
+    await circuitBreaker.ExecuteAsync(context, forwarder);
+}
