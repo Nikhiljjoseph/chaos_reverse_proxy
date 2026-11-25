@@ -38,43 +38,6 @@ The rate limiter runs first, so excess traffic is rejected before it costs anyth
 | `ChaosEngine.Enabled` | Turn fault injection on or off |
 | `ChaosEngine.LatencyProbability` / `FaultProbability` / `AbortProbability` | Chance of each fault per request (0–1) |
 
-{
-  "Logging": {
-    "LogLevel": {
-      "Default": "Warning",
-      "Microsoft.AspNetCore": "Warning"
-    }
-  },
-  "Forwarder": {
-    "TargetBaseUri": "http://localhost:5200",
-    "RequestTimeoutMs": 250,
-    "CustomHopByHopHeaders": [
-      "X-Internal-Secret",
-      "X-Custom-Trace"
-    ]
-  },
-  "Chaos": {
-    "Enabled": false,
-    "LatencyProbability": 0.10,
-    "LatencyMinMs": 400,
-    "LatencyMaxMs": 800,
-    "FaultProbability": 0.10,
-    "FaultStatusCode": 500,
-    "AbortProbability": 0.1
-  },
-  "CircuitBreaker": {
-    "Enabled": true,
-    "FailureThreshold": 5,
-    "BreakDurationSeconds": 4
-  },
-  "RateLimiter": {
-    "Capacity": 50,
-    "TokensPerSecond": 25,
-    "BucketIdleTimeoutMinutes": 5
-  }
-}
-
-
 ---
 
 ## Getting started
